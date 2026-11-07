@@ -1,2 +1,2 @@
-# TWRP-Pro11-MT6735
-TWRP build for PRO11 MT6735 XSD-PRO11 TAB PC CHINA
+# TWRP XSD Pro11 (MT6735)
+Actions -> "Build TWRP Pro11" -> Run workflow -> (branch: twrp-12.1) -> unduh artifact recovery.img.
