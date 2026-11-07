@@ -1,5 +1,4 @@
-# Untuk branch twrp-9.0 ke atas (default workflow: twrp-12.1)
-$(call inherit-product, $(SRC_TARGET_DIR)/product/embedded.mk)
+# Untuk branch twrp-11 / twrp-12.1
 $(call inherit-product, vendor/twrp/config/common.mk)
 
 PRODUCT_COPY_FILES += $(LOCAL_PATH)/prebuilt/zImage-dtb:kernel
