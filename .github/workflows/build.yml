@@ -1,1 +1,91 @@
+name: Build TWRP Pro11
 
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch TWRP minimal manifest (twrp-12.1 / twrp-11 / twrp-9.0 / twrp-7.1)"
+        default: "twrp-12.1"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kosongkan disk runner
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      - name: Install dependensi
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 libncurses5 lib32ncurses-dev \
+            x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc \
+            unzip fontconfig python-is-python3 openjdk-8-jdk lz4 ccache bc
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          git config --global user.name "builder"
+          git config --global user.email "builder@example.com"
+
+      - name: Sync source TWRP
+        run: |
+          export PATH=$HOME/bin:$PATH
+          BR="${{ github.event.inputs.branch }}"
+          mkdir -p ~/twrp && cd ~/twrp
+          if [ "$BR" = "twrp-7.1" ]; then
+            MAN=platform_manifest_twrp_omni
+          elif [ "$BR" = "twrp-9.0" ]; then
+            MAN=platform_manifest_twrp_omni
+          else
+            MAN=platform_manifest_twrp_aosp
+          fi
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/$MAN.git -b $BR
+          repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
+
+      - name: Pasang device tree
+        run: |
+          BR="${{ github.event.inputs.branch }}"
+          mkdir -p ~/twrp/device/xsd
+          cp -r $GITHUB_WORKSPACE/device/xsd/Pro11 ~/twrp/device/xsd/Pro11
+          if [ "$BR" = "twrp-7.1" ] || [ "$BR" = "twrp-9.0" ]; then
+            cd ~/twrp/device/xsd/Pro11
+            cp twrp_Pro11.mk omni_Pro11.mk
+            sed -i 's/twrp_Pro11/omni_Pro11/g; s#vendor/twrp/config/common.mk#build/target/product/full_base.mk#' omni_Pro11.mk
+            sed -i 's/twrp_Pro11/omni_Pro11/g' AndroidProducts.mk vendorsetup.sh
+          fi
+
+      - name: Build recovery
+        run: |
+          export LC_ALL=C
+          export ALLOW_MISSING_DEPENDENCIES=true
+          cd ~/twrp
+          source build/envsetup.sh
+          BR="${{ github.event.inputs.branch }}"
+          if [ "$BR" = "twrp-7.1" ] || [ "$BR" = "twrp-9.0" ]; then
+            export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+            lunch omni_Pro11-eng
+          else
+            lunch twrp_Pro11-eng
+          fi
+          mka recoveryimage -j$(nproc)
+
+      - name: Kumpulkan hasil
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/out
+          cp ~/twrp/out/target/product/Pro11/recovery.img $GITHUB_WORKSPACE/out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TWRP-Pro11-${{ github.event.inputs.branch }}
+          path: out/recovery.img
