@@ -31,7 +31,7 @@ jobs:
           sudo apt-get install -y git-core gnupg flex bison build-essential zip curl \
             zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 libncurses5 lib32ncurses-dev \
             x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc \
-            unzip fontconfig python-is-python3 openjdk-8-jdk lz4 ccache bc
+            unzip fontconfig python-is-python3 openjdk-8-jdk lz4 ccache bc pigz
           mkdir -p ~/bin
           curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
@@ -92,11 +92,12 @@ jobs:
       - name: Pangkas dan susun ulang image agar muat 16 MB
         if: always()
         run: |
-          set -euo pipefail
+          set -eu
           OUT=$HOME/twrp/out/target/product/Pro11
           ROOT=$OUT/recovery/root
           HOST=$HOME/twrp/out/host/linux-x86/bin
           LIMIT=16711680   # 16 MB dikurangi margin 64 KB
+          W=$HOME/repack   # BUKAN $HOME/work: itu folder milik runner GitHub
           mkdir -p $HOME/final
           REPORT=$HOME/final/laporan.txt
           : > $REPORT
@@ -117,19 +118,34 @@ jobs:
             exit 1
           fi
 
-          rm -rf $HOME/work && mkdir -p $HOME/work
-          cp -a "$ROOT" $HOME/work/root
+          rm -rf $W && mkdir -p $W
+          cp -a "$ROOT" $W/root
+
+          echo "=== 45 file/folder terbesar SEBELUM dipangkas ===" >> $REPORT
+          { du -ab $W/root | sort -rn | head -45; } >> $REPORT 2>/dev/null || true
+          echo >> $REPORT
 
           pack() {
-            "$HOST/mkbootfs" -d "$OUT/system" $HOME/work/root > $HOME/work/r.cpio
-            gzip -9n < $HOME/work/r.cpio > $HOME/work/r.img
-            "$HOST/mkbootimg" --kernel "$OUT/kernel" --ramdisk $HOME/work/r.img \
+            "$HOST/mkbootfs" -d "$OUT/system" $W/root > $W/r.cpio
+            if [ "${1:-gzip}" = "zopfli" ]; then
+              pigz -11 -n -c < $W/r.cpio > $W/r.img
+            else
+              gzip -9n < $W/r.cpio > $W/r.img
+            fi
+            "$HOST/mkbootimg" --kernel "$OUT/kernel" --ramdisk $W/r.img \
               --cmdline "bootopt=64S3,32N2,32N2" --base 0x40000000 --pagesize 2048 \
               --kernel_offset 0x00008000 --ramdisk_offset 0x04000000 \
               --second_offset 0x00f00000 --tags_offset 0x0e000000 \
               --os_version 7.0.0 --os_patch_level 2017-12 \
-              --output $HOME/work/recovery.img
-            stat -c %s $HOME/work/recovery.img
+              --output $W/recovery.img
+            stat -c %s $W/recovery.img
+          }
+
+          must_pack() {
+            SIZE=$(pack "$@")
+            case "$SIZE" in
+              ''|*[!0-9]*) echo "Gagal menyusun image: $SIZE" | tee -a $REPORT; exit 1;;
+            esac
           }
 
           STEPS=(
@@ -141,7 +157,7 @@ jobs:
             "Layanan HAL boot dan health|system/bin/android.hardware.boot@1.0-service system/bin/android.hardware.boot@1.1-service system/bin/android.hardware.health@2.1-service"
           )
 
-          SIZE=$(pack)
+          must_pack
           echo "Ukuran awal setelah susun ulang: $SIZE byte (batas $LIMIT)" | tee -a $REPORT
 
           for step in "${STEPS[@]}"; do
@@ -149,21 +165,34 @@ jobs:
             label=${step%%|*}
             paths=${step#*|}
             if [ "$paths" = "LANG" ]; then
-              find $HOME/work/root/twres/languages -type f ! -name en.xml ! -name id.xml -delete 2>/dev/null || true
+              find $W/root/twres/languages -type f ! -name en.xml ! -name id.xml -delete 2>/dev/null || true
             else
-              for p in $paths; do rm -f "$HOME/work/root/$p"; done
+              for p in $paths; do rm -f "$W/root/$p"; done
             fi
-            SIZE=$(pack)
+            must_pack
             echo "Dihapus: $label -> $SIZE byte" | tee -a $REPORT
           done
 
           if [ "$SIZE" -gt "$LIMIT" ]; then
-            echo "MASIH TERLALU BESAR: $SIZE byte. File terbesar di ramdisk:" | tee -a $REPORT
-            du -ab $HOME/work/root | sort -rn | head -40 | tee -a $REPORT
+            echo "Masih besar. Coba kompresi zopfli (lebih kecil, lebih lambat)..." | tee -a $REPORT
+            if command -v pigz >/dev/null 2>&1; then
+              must_pack zopfli
+              echo "Dengan zopfli: $SIZE byte" | tee -a $REPORT
+            else
+              echo "pigz tidak tersedia, lewati zopfli" | tee -a $REPORT
+            fi
+          fi
+
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "MASIH TERLALU BESAR: $SIZE byte (batas $LIMIT)." | tee -a $REPORT
+            echo "=== 45 file/folder terbesar SESUDAH dipangkas ===" >> $REPORT
+            { du -ab $W/root | sort -rn | head -45; } >> $REPORT 2>/dev/null || true
+            # simpan juga image oversize untuk diperiksa (JANGAN di-flash)
+            cp $W/recovery.img $HOME/final/OVERSIZE_JANGAN_FLASH.img
             exit 1
           fi
 
-          cp $HOME/work/recovery.img $HOME/final/recovery.img
+          cp $W/recovery.img $HOME/final/recovery.img
           echo "SELESAI. Ukuran akhir: $SIZE byte" | tee -a $REPORT
           ls -l $HOME/final | tee -a $REPORT
 
@@ -197,5 +226,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: TWRP-Pro11-${{ github.event.inputs.branch }}
-          path: ~/final/recovery.img
+          path: |
+            ~/final/recovery.img
+            ~/final/OVERSIZE_JANGAN_FLASH.img
           if-no-files-found: warn
