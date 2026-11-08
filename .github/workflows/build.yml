@@ -86,25 +86,102 @@ jobs:
           else
             lunch twrp_Pro11-eng
           fi
-          mka recoveryimage -j$(nproc) 2>&1 | tee ~/build.log
+          # Lanjut walau gagal di cek ukuran; langkah berikutnya memangkas ramdisk.
+          mka recoveryimage -j$(nproc) 2>&1 | tee ~/build.log || true
+
+      - name: Pangkas dan susun ulang image agar muat 16 MB
+        if: always()
+        run: |
+          set -euo pipefail
+          OUT=$HOME/twrp/out/target/product/Pro11
+          ROOT=$OUT/recovery/root
+          HOST=$HOME/twrp/out/host/linux-x86/bin
+          LIMIT=16711680   # 16 MB dikurangi margin 64 KB
+          mkdir -p $HOME/final
+          REPORT=$HOME/final/laporan.txt
+          : > $REPORT
+
+          NATIVE=$OUT/recovery.img
+          if [ -f "$NATIVE" ] && [ "$(stat -c %s "$NATIVE")" -le "$LIMIT" ]; then
+            cp "$NATIVE" $HOME/final/recovery.img
+            echo "Image bawaan build sudah muat: $(stat -c %s "$NATIVE") byte" | tee -a $REPORT
+            exit 0
+          fi
+
+          if [ ! -f "$ROOT/system/bin/recovery" ] && [ ! -f "$ROOT/sbin/recovery" ]; then
+            echo "Binary recovery tidak ada di ramdisk. Build belum benar." | tee -a $REPORT
+            exit 1
+          fi
+          if [ ! -f "$OUT/kernel" ]; then
+            echo "Kernel tidak ditemukan di $OUT/kernel" | tee -a $REPORT
+            exit 1
+          fi
+
+          rm -rf $HOME/work && mkdir -p $HOME/work
+          cp -a "$ROOT" $HOME/work/root
+
+          pack() {
+            "$HOST/mkbootfs" -d "$OUT/system" $HOME/work/root > $HOME/work/r.cpio
+            gzip -9n < $HOME/work/r.cpio > $HOME/work/r.img
+            "$HOST/mkbootimg" --kernel "$OUT/kernel" --ramdisk $HOME/work/r.img \
+              --cmdline "bootopt=64S3,32N2,32N2" --base 0x40000000 --pagesize 2048 \
+              --kernel_offset 0x00008000 --ramdisk_offset 0x04000000 \
+              --second_offset 0x00f00000 --tags_offset 0x0e000000 \
+              --os_version 7.0.0 --os_patch_level 2017-12 \
+              --output $HOME/work/recovery.img
+            stat -c %s $HOME/work/recovery.img
+          }
+
+          STEPS=(
+            "App TWRP|system/bin/me.twrp.twrpapp.apk system/bin/privapp-permissions-twrpapp.xml"
+            "fastbootd|system/bin/fastbootd system/lib/android.hardware.fastboot@1.0.so"
+            "Bahasa tambahan (sisakan en dan id)|LANG"
+            "bash|system/bin/bash"
+            "Alat exFAT dan FAT|system/bin/exfat-fuse system/bin/fsck.exfat system/bin/mkexfatfs system/bin/fatlabel system/bin/fsck.fat system/bin/mkfs.fat"
+            "Layanan HAL boot dan health|system/bin/android.hardware.boot@1.0-service system/bin/android.hardware.boot@1.1-service system/bin/android.hardware.health@2.1-service"
+          )
+
+          SIZE=$(pack)
+          echo "Ukuran awal setelah susun ulang: $SIZE byte (batas $LIMIT)" | tee -a $REPORT
+
+          for step in "${STEPS[@]}"; do
+            if [ "$SIZE" -le "$LIMIT" ]; then break; fi
+            label=${step%%|*}
+            paths=${step#*|}
+            if [ "$paths" = "LANG" ]; then
+              find $HOME/work/root/twres/languages -type f ! -name en.xml ! -name id.xml -delete 2>/dev/null || true
+            else
+              for p in $paths; do rm -f "$HOME/work/root/$p"; done
+            fi
+            SIZE=$(pack)
+            echo "Dihapus: $label -> $SIZE byte" | tee -a $REPORT
+          done
+
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "MASIH TERLALU BESAR: $SIZE byte. File terbesar di ramdisk:" | tee -a $REPORT
+            du -ab $HOME/work/root | sort -rn | head -40 | tee -a $REPORT
+            exit 1
+          fi
+
+          cp $HOME/work/recovery.img $HOME/final/recovery.img
+          echo "SELESAI. Ukuran akhir: $SIZE byte" | tee -a $REPORT
+          ls -l $HOME/final | tee -a $REPORT
 
       - name: Ringkasan hasil
         if: always()
         run: |
           {
             echo "=== Ukuran image ==="
-            ls -l ~/twrp/out/target/product/Pro11/*.img 2>&1
+            ls -l ~/twrp/out/target/product/Pro11/*.img ~/final/* 2>&1
             echo
-            echo "=== Isi system/bin di ramdisk recovery ==="
-            ls -la ~/twrp/out/target/product/Pro11/recovery/root/system/bin 2>&1 | head -50
+            echo "=== File terbesar di ramdisk recovery ==="
+            du -ab ~/twrp/out/target/product/Pro11/recovery/root 2>/dev/null | sort -rn | head -40
             echo
-            echo "=== Pesan 'missing' di log ==="
-            grep -i "missing" ~/build.log | head -80
-            echo
-            echo "=== Pesan error/warning penting ==="
-            grep -iE "error:|FAILED|warning: .*(recovery|twrp)" ~/build.log | head -80
+            echo "=== Pesan error penting ==="
+            grep -iE "error:|FAILED" ~/build.log | head -40
           } > ~/ringkasan.txt 2>&1 || true
           cat ~/ringkasan.txt
+
       - name: Simpan log build
         if: always()
         uses: actions/upload-artifact@v4
@@ -113,13 +190,12 @@ jobs:
           path: |
             ~/build.log
             ~/ringkasan.txt
+            ~/final/laporan.txt
 
-      - name: Kumpulkan hasil
-        run: |
-          mkdir -p $GITHUB_WORKSPACE/out
-          cp ~/twrp/out/target/product/Pro11/recovery.img $GITHUB_WORKSPACE/out/
-
-      - uses: actions/upload-artifact@v4
+      - name: Simpan hasil recovery
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: TWRP-Pro11-${{ github.event.inputs.branch }}
-          path: out/recovery.img
+          path: ~/final/recovery.img
+          if-no-files-found: warn
