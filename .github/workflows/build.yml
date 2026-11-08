@@ -1,4 +1,4 @@
-[8 Nov 2026 01.19] PLR ( Persatuan Lelaki Ramah ): name: Build TWRP Pro11
+name: Build TWRP Pro11
 
 on:
   workflow_dispatch:
