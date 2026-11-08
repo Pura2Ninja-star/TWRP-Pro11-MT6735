@@ -1,11 +1,11 @@
-name: Build TWRP Pro11
+[8 Nov 2026 01.19] PLR ( Persatuan Lelaki Ramah ): name: Build TWRP Pro11
 
 on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "Branch TWRP minimal manifest (twrp-12.1 / twrp-11 / twrp-9.0 / twrp-7.1)"
-        default: "twrp-12.1"
+        description: "Branch TWRP (twrp-11 / twrp-12.1 / twrp-9.0 / twrp-7.1)"
+        default: "twrp-11"
         required: true
 
 jobs:
@@ -38,14 +38,21 @@ jobs:
           git config --global user.name "builder"
           git config --global user.email "builder@example.com"
 
+      - name: Python 2 untuk branch lama
+        run: |
+          BR="${{ github.event.inputs.branch }}"
+          if [ "$BR" = "twrp-7.1" ] || [ "$BR" = "twrp-9.0" ]; then
+            sudo apt-get install -y python2
+            sudo apt-get remove -y python-is-python3
+            sudo ln -sf /usr/bin/python2 /usr/bin/python
+          fi
+
       - name: Sync source TWRP
         run: |
           export PATH=$HOME/bin:$PATH
           BR="${{ github.event.inputs.branch }}"
           mkdir -p ~/twrp && cd ~/twrp
-          if [ "$BR" = "twrp-7.1" ]; then
-            MAN=platform_manifest_twrp_omni
-          elif [ "$BR" = "twrp-9.0" ]; then
+          if [ "$BR" = "twrp-7.1" ] || [ "$BR" = "twrp-9.0" ]; then
             MAN=platform_manifest_twrp_omni
           else
             MAN=platform_manifest_twrp_aosp
@@ -67,6 +74,7 @@ jobs:
 
       - name: Build recovery
         run: |
+          set -o pipefail
           export LC_ALL=C
           export ALLOW_MISSING_DEPENDENCIES=true
           cd ~/twrp
@@ -78,7 +86,33 @@ jobs:
           else
             lunch twrp_Pro11-eng
           fi
-          mka recoveryimage -j$(nproc)
+          mka recoveryimage -j$(nproc) 2>&1 | tee ~/build.log
+
+      - name: Ringkasan hasil
+        if: always()
+        run: |
+          {
+            echo "=== Ukuran image ==="
+            ls -l ~/twrp/out/target/product/Pro11/*.img 2>&1
+            echo
+            echo "=== Isi system/bin di ramdisk recovery ==="
+            ls -la ~/twrp/out/target/product/Pro11/recovery/root/system/bin 2>&1 | head -50
+            echo
+            echo "=== Pesan 'missing' di log ==="
+            grep -i "missing" ~/build.log | head -80
+            echo
+            echo "=== Pesan error/warning penting ==="
+            grep -iE "error:|FAILED|warning: .*(recovery|twrp)" ~/build.log | head -80
+          } > ~/ringkasan.txt 2>&1 || true
+          cat ~/ringkasan.txt
+      - name: Simpan log build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            ~/build.log
+            ~/ringkasan.txt
 
       - name: Kumpulkan hasil
         run: |
