@@ -97,6 +97,7 @@ jobs:
           ROOT=$OUT/recovery/root
           HOST=$HOME/twrp/out/host/linux-x86/bin
           LIMIT=16711680   # 16 MB dikurangi margin 64 KB
+          SLACK=300000     # selisih kira-kira antara gzip -9 dan zopfli
           W=$HOME/repack   # BUKAN $HOME/work: itu folder milik runner GitHub
           mkdir -p $HOME/final
           REPORT=$HOME/final/laporan.txt
@@ -121,10 +122,6 @@ jobs:
           rm -rf $W && mkdir -p $W
           cp -a "$ROOT" $W/root
 
-          echo "=== 45 file/folder terbesar SEBELUM dipangkas ===" >> $REPORT
-          { du -ab $W/root | sort -rn | head -45; } >> $REPORT 2>/dev/null || true
-          echo >> $REPORT
-
           pack() {
             "$HOST/mkbootfs" -d "$OUT/system" $W/root > $W/r.cpio
             if [ "${1:-gzip}" = "zopfli" ]; then
@@ -148,38 +145,83 @@ jobs:
             esac
           }
 
+          # Hapus library hanya kalau tidak ada biner/library lain yang menyebut namanya
+          rm_if_unreferenced() {
+            base=$(basename "$1")
+            if grep -rlaF --exclude="$base" -- "$base" $W/root/system/bin $W/root/system/lib 2>/dev/null | grep -q .; then
+              echo "  dilewati (masih dirujuk): $1" | tee -a $REPORT
+            else
+              rm -f "$W/root/$1"
+              echo "  dihapus: $1" | tee -a $REPORT
+            fi
+          }
+
+          # Urutan dari yang paling aman dan paling hemat
           STEPS=(
-            "App TWRP|system/bin/me.twrp.twrpapp.apk system/bin/privapp-permissions-twrpapp.xml"
-            "fastbootd|system/bin/fastbootd system/lib/android.hardware.fastboot@1.0.so"
-            "Bahasa tambahan (sisakan en dan id)|LANG"
+            "Terminfo (sisakan 7 entri umum)|TERMINFO"
+            "Daftar checksum ramdisk|ramdisk-files.sha256sum ramdisk-files.txt"
+            "Library tak terpakai (ubsan, libssh)|UNUSEDLIBS:system/lib/libclang_rt.ubsan_standalone-arm-android.so system/lib/libssh.so"
             "bash|system/bin/bash"
+            "fastbootd|system/bin/fastbootd system/lib/android.hardware.fastboot@1.0.so"
+            "App TWRP|system/bin/me.twrp.twrpapp.apk system/bin/privapp-permissions-twrpapp.xml"
+            "Bahasa tambahan (sisakan en dan id)|LANG"
             "Alat exFAT dan FAT|system/bin/exfat-fuse system/bin/fsck.exfat system/bin/mkexfatfs system/bin/fatlabel system/bin/fsck.fat system/bin/mkfs.fat"
             "Layanan HAL boot dan health|system/bin/android.hardware.boot@1.0-service system/bin/android.hardware.boot@1.1-service system/bin/android.hardware.health@2.1-service"
+            "Data zona waktu (tzdata)|system/usr/share/zoneinfo/tzdata"
+            "keystore (dekripsi tidak dipakai)|system/bin/keystore"
           )
+          N=${#STEPS[@]}
+          IDX=0
 
-          must_pack
-          echo "Ukuran awal setelah susun ulang: $SIZE byte (batas $LIMIT)" | tee -a $REPORT
-
-          for step in "${STEPS[@]}"; do
-            if [ "$SIZE" -le "$LIMIT" ]; then break; fi
+          apply_step() {
+            step="${STEPS[$IDX]}"
             label=${step%%|*}
             paths=${step#*|}
-            if [ "$paths" = "LANG" ]; then
-              find $W/root/twres/languages -type f ! -name en.xml ! -name id.xml -delete 2>/dev/null || true
-            else
-              for p in $paths; do rm -f "$W/root/$p"; done
-            fi
+            echo "Langkah $((IDX+1))/$N: $label" | tee -a $REPORT
+            case "$paths" in
+              LANG)
+                find $W/root/twres/languages -type f ! -name en.xml ! -name id.xml -delete 2>/dev/null || true ;;
+              TERMINFO)
+                find $W/root/system/etc/terminfo -type f ! -name linux ! -name vt100 ! -name xterm ! -name xterm-256color ! -name ansi ! -name dumb ! -name screen -delete 2>/dev/null || true
+                find $W/root/system/etc/terminfo -type d -empty -delete 2>/dev/null || true ;;
+              UNUSEDLIBS:*)
+                for p in ${paths#UNUSEDLIBS:}; do rm_if_unreferenced "$p"; done ;;
+              *)
+                for p in $paths; do rm -f "$W/root/$p"; done ;;
+            esac
+            IDX=$((IDX+1))
+          }
+
+          echo "=== 45 file/folder terbesar SEBELUM dipangkas ===" >> $REPORT
+          { du -ab $W/root | sort -rn | head -45; } >> $REPORT 2>/dev/null || true
+          echo >> $REPORT
+
+          # Fase A: cepat, pakai gzip -9
+          must_pack
+          echo "Awal (gzip -9): $SIZE byte. Batas $LIMIT" | tee -a $REPORT
+          while [ "$SIZE" -gt $((LIMIT + SLACK)) ] && [ "$IDX" -lt "$N" ]; do
+            apply_step
             must_pack
-            echo "Dihapus: $label -> $SIZE byte" | tee -a $REPORT
+            echo "  -> $SIZE byte (gzip -9)" | tee -a $REPORT
           done
 
+          # Fase B: kompresi zopfli (lebih rapat), lanjut memangkas kalau perlu
           if [ "$SIZE" -gt "$LIMIT" ]; then
-            echo "Masih besar. Coba kompresi zopfli (lebih kecil, lebih lambat)..." | tee -a $REPORT
             if command -v pigz >/dev/null 2>&1; then
               must_pack zopfli
               echo "Dengan zopfli: $SIZE byte" | tee -a $REPORT
+              while [ "$SIZE" -gt "$LIMIT" ] && [ "$IDX" -lt "$N" ]; do
+                apply_step
+                must_pack zopfli
+                echo "  -> $SIZE byte (zopfli)" | tee -a $REPORT
+              done
             else
-              echo "pigz tidak tersedia, lewati zopfli" | tee -a $REPORT
+              echo "pigz tidak tersedia; lanjut dengan gzip" | tee -a $REPORT
+              while [ "$SIZE" -gt "$LIMIT" ] && [ "$IDX" -lt "$N" ]; do
+                apply_step
+                must_pack
+                echo "  -> $SIZE byte (gzip -9)" | tee -a $REPORT
+              done
             fi
           fi
 
@@ -187,7 +229,6 @@ jobs:
             echo "MASIH TERLALU BESAR: $SIZE byte (batas $LIMIT)." | tee -a $REPORT
             echo "=== 45 file/folder terbesar SESUDAH dipangkas ===" >> $REPORT
             { du -ab $W/root | sort -rn | head -45; } >> $REPORT 2>/dev/null || true
-            # simpan juga image oversize untuk diperiksa (JANGAN di-flash)
             cp $W/recovery.img $HOME/final/OVERSIZE_JANGAN_FLASH.img
             exit 1
           fi
